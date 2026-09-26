@@ -53,6 +53,18 @@ func writeBytea(w *bufio.Writer, b []byte) {
 }
 
 func makeEncoder(c Col, yearOffset int, fx *fixes) (encoder, error) {
+	if c.MsType == "timestamp" {
+		// rowversion MS SQL (_Version) в PostgreSQL — счетчик int4; платформа при переносе
+		// базы (ibcmd infobase replicate) начинает его с 1, так же делаем и мы.
+		return func(w *bufio.Writer, v any) error {
+			if v == nil {
+				writeNull(w)
+			} else {
+				w.WriteByte('1')
+			}
+			return nil
+		}, nil
+	}
 	switch c.PgType {
 	case "bytea":
 		return func(w *bufio.Writer, v any) error {

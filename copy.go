@@ -160,10 +160,7 @@ type stats struct {
 
 func runTask(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tk Task, yearOffset int, st *stats) (int64, error) {
 	t := tk.T
-	off := 0
-	if t.DataTable {
-		off = yearOffset
-	}
+	off := yearOffset // сдвиг лет есть и в служебных таблицах (config, configcas...)
 	var fx fixes
 	encs := make([]encoder, len(t.Cols))
 	msCols := make([]string, len(t.Cols))
@@ -253,16 +250,27 @@ func runTask(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tk Task, yearOff
 	return n, nil
 }
 
-func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table, workers int, splitRows int64, yearOffset int, truncate bool) error {
+// partsFor — на сколько частей резать таблицу: по числу строк и по объему, берется большее.
+func partsFor(t *Table, splitRows, splitMB int64) int {
+	parts := 1
+	if splitRows > 0 && t.Rows > splitRows {
+		parts = int(t.Rows/splitRows) + 1
+	}
+	if splitMB > 0 && t.SizeMB > splitMB {
+		if p := int(t.SizeMB/splitMB) + 1; p > parts {
+			parts = p
+		}
+	}
+	if parts > 64 {
+		parts = 64
+	}
+	return parts
+}
+
+func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table, workers int, splitRows, splitMB int64, yearOffset int, truncate bool) error {
 	var tasks []Task
 	for _, t := range tables {
-		parts := 1
-		if splitRows > 0 && t.Rows > splitRows {
-			parts = int(t.Rows/splitRows) + 1
-			if parts > 64 {
-				parts = 64
-			}
-		}
+		parts := partsFor(t, splitRows, splitMB)
 		tt, err := splitTable(ctx, db, t, parts)
 		if err != nil {
 			return fmt.Errorf("%s: разбиение: %w", t.Name, err)

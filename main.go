@@ -22,12 +22,15 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "copy", "copy | plan | verify-counts | verify-pg")
+	mode := flag.String("mode", "copy", "copy | plan | splits | verify-counts | verify-pg | ddl")
 	workers := flag.Int("workers", 24, "число параллельных потоков")
 	splitRows := flag.Int64("split-rows", 20_000_000, "таблицы больше этого числа строк делятся на части по ключу")
+	splitMB := flag.Int64("split-mb", 2048, "таблицы больше этого объема (МБ, с LOB) делятся на части по ключу")
+	ddlFile := flag.String("ddl", "", "режим ddl: файл с командами (CREATE INDEX, ALTER TABLE ...), выполняются параллельно")
 	only := flag.String("only", "", "регулярное выражение: переносить только эти таблицы (имена PG)")
 	exclude := flag.String("exclude", "", "регулярное выражение: не переносить эти таблицы (имена PG)")
 	truncate := flag.Bool("truncate", false, "очистить целевые таблицы перед заливкой")
+	ignoreCols := flag.String("ignore-cols", "", "verify-pg: колонки через запятую, которые не сравнивать (например _version)")
 	yearOffset := flag.Int("year-offset", -1, "сдвиг лет дат 1С в MS SQL; -1 — взять из _YearOffset")
 	flag.Parse()
 
@@ -61,6 +64,13 @@ func main() {
 		return true
 	}
 
+	if *mode == "ddl" {
+		if err := runDDL(ctx, pg, *ddlFile, *workers); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	if *mode == "verify-pg" {
 		refCfg, err := pgxpool.ParseConfig(refDSN)
 		if err != nil {
@@ -79,7 +89,11 @@ func main() {
 			}
 		}
 		sort.Strings(names)
-		if err := verifyPg(ctx, pg, ref, names, *workers); err != nil {
+		var ignore []string
+		if *ignoreCols != "" {
+			ignore = strings.Split(*ignoreCols, ",")
+		}
+		if err := verifyPg(ctx, pg, ref, names, *workers, ignore); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -92,7 +106,7 @@ func main() {
 	db.SetMaxOpenConns(*workers + 2)
 	defer db.Close()
 
-	msCols, counts, keys, err := loadMs(ctx, db)
+	msCols, counts, keys, sizes, err := loadMs(ctx, db)
 	if err != nil {
 		log.Fatal("MS SQL: ", err)
 	}
@@ -104,7 +118,7 @@ func main() {
 			}
 		}
 	}
-	all, problems := buildTables(pgCols, msCols, counts, keys)
+	all, problems := buildTables(pgCols, msCols, counts, keys, sizes)
 	for _, p := range problems {
 		log.Print("структура: ", p)
 	}
@@ -133,10 +147,7 @@ func main() {
 		}
 	case "splits":
 		for _, t := range tables {
-			parts := 1
-			if *splitRows > 0 && t.Rows > *splitRows {
-				parts = int(t.Rows / *splitRows) + 1
-			}
+			parts := partsFor(t, *splitRows, *splitMB)
 			tasks, err := splitTable(ctx, db, t, parts)
 			if err != nil {
 				log.Fatalf("%s: %v", t.Name, err)
@@ -146,7 +157,7 @@ func main() {
 			}
 		}
 	case "copy":
-		if err := runCopy(ctx, db, pg, tables, *workers, *splitRows, *yearOffset, *truncate); err != nil {
+		if err := runCopy(ctx, db, pg, tables, *workers, *splitRows, *splitMB, *yearOffset, *truncate); err != nil {
 			log.Fatal(err)
 		}
 	case "verify-counts":

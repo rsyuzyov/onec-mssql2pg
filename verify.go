@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,11 +18,15 @@ type tableSum struct {
 }
 
 // pgTableSum — число строк и не зависящая от порядка сумма хешей строк таблицы.
-func pgTableSum(ctx context.Context, pool *pgxpool.Pool, table string) (tableSum, error) {
+func pgTableSum(ctx context.Context, pool *pgxpool.Pool, table string, ignore []string) (tableSum, error) {
 	var s tableSum
 	var h *string
+	row := "t::text"
+	if len(ignore) > 0 {
+		row = "(to_jsonb(t) - array['" + strings.Join(ignore, "','") + "'])::text"
+	}
 	err := pool.QueryRow(ctx, fmt.Sprintf(
-		"select count(*), sum(hashtextextended(t::text, 0)::numeric)::text from %s t", qpg(table))).Scan(&s.rows, &h)
+		"select count(*), sum(hashtextextended(%s, 0)::numeric)::text from %s t", row, qpg(table))).Scan(&s.rows, &h)
 	if h != nil {
 		s.hash = *h
 	}
@@ -29,7 +34,7 @@ func pgTableSum(ctx context.Context, pool *pgxpool.Pool, table string) (tableSum
 }
 
 // verifyPg сравнивает построчно две базы PG (перенос против эталона) по всем таблицам.
-func verifyPg(ctx context.Context, a, b *pgxpool.Pool, tables []string, workers int) error {
+func verifyPg(ctx context.Context, a, b *pgxpool.Pool, tables []string, workers int, ignore []string) error {
 	type res struct {
 		name   string
 		sa, sb tableSum
@@ -44,9 +49,9 @@ func verifyPg(ctx context.Context, a, b *pgxpool.Pool, tables []string, workers 
 			defer wg.Done()
 			for t := range ch {
 				r := res{name: t}
-				r.sa, r.err = pgTableSum(ctx, a, t)
+				r.sa, r.err = pgTableSum(ctx, a, t, ignore)
 				if r.err == nil {
-					r.sb, r.err = pgTableSum(ctx, b, t)
+					r.sb, r.err = pgTableSum(ctx, b, t, ignore)
 				}
 				out <- r
 			}

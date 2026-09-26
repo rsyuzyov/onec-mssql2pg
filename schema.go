@@ -28,6 +28,7 @@ type Table struct {
 	MsName    string // имя в MS SQL
 	Cols      []Col
 	Rows      int64    // оценка числа строк по sys.partitions
+	SizeMB    int64    // объем таблицы в MS SQL вместе с LOB
 	Keys      []KeyCol // колонки кластерного индекса в MS SQL по порядку
 	DataTable bool     // таблица данных 1С (имя с "_"), к ее датам применяется сдвиг лет
 }
@@ -63,7 +64,7 @@ type msCol struct {
 	maxLen, prec, scale int
 }
 
-func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int64, map[string][]msCol, error) {
+func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int64, map[string][]msCol, map[string]int64, error) {
 	cols := map[string][]msCol{}
 	rows, err := db.QueryContext(ctx, `
 		select t.name, c.name, ty.name, c.max_length, c.precision, c.scale
@@ -72,13 +73,13 @@ func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int
 		join sys.types ty on ty.user_type_id = c.user_type_id
 		order by t.name, c.column_id`)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	for rows.Next() {
 		var c msCol
 		if err := rows.Scan(&c.table, &c.name, &c.typ, &c.maxLen, &c.prec, &c.scale); err != nil {
 			rows.Close()
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		cols[strings.ToLower(c.table)] = append(cols[strings.ToLower(c.table)], c)
 	}
@@ -90,14 +91,14 @@ func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int
 		from sys.tables t join sys.partitions p on p.object_id = t.object_id and p.index_id in (0, 1)
 		group by t.name`)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	for rows.Next() {
 		var n string
 		var r int64
 		if err := rows.Scan(&n, &r); err != nil {
 			rows.Close()
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		counts[strings.ToLower(n)] = r
 	}
@@ -113,18 +114,38 @@ func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int
 		join sys.types ty on ty.user_type_id = c.user_type_id
 		order by t.name, ic.key_ordinal`)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	for rows.Next() {
 		var c msCol
 		if err := rows.Scan(&c.table, &c.name, &c.typ, &c.maxLen, &c.prec, &c.scale); err != nil {
 			rows.Close()
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		keys[strings.ToLower(c.table)] = append(keys[strings.ToLower(c.table)], c)
 	}
 	rows.Close()
-	return cols, counts, keys, nil
+	sizes := map[string]int64{}
+	rows, err = db.QueryContext(ctx, `
+		select t.name, sum(a.total_pages) * 8 / 1024
+		from sys.tables t
+		join sys.partitions p on p.object_id = t.object_id and p.index_id in (0, 1)
+		join sys.allocation_units a on a.container_id = p.partition_id
+		group by t.name`)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	for rows.Next() {
+		var n string
+		var mb int64
+		if err := rows.Scan(&n, &mb); err != nil {
+			rows.Close()
+			return nil, nil, nil, nil, err
+		}
+		sizes[strings.ToLower(n)] = mb
+	}
+	rows.Close()
+	return cols, counts, keys, sizes, nil
 }
 
 // msTypeDecl — объявление типа для CONVERT(<тип>, 0x...).
@@ -142,7 +163,7 @@ func msTypeDecl(c msCol) string {
 }
 
 // buildTables сопоставляет таблицы PG (они задают состав) с таблицами MS SQL.
-func buildTables(pg map[string][]pgCol, ms map[string][]msCol, counts map[string]int64, keys map[string][]msCol) ([]*Table, []string) {
+func buildTables(pg map[string][]pgCol, ms map[string][]msCol, counts map[string]int64, keys map[string][]msCol, sizes map[string]int64) ([]*Table, []string) {
 	var tables []*Table
 	var problems []string
 	for name, pcols := range pg {
@@ -155,7 +176,7 @@ func buildTables(pg map[string][]pgCol, ms map[string][]msCol, counts map[string
 		for _, c := range mcols {
 			byName[strings.ToLower(c.name)] = c
 		}
-		t := &Table{Name: name, MsName: mcols[0].table, Rows: counts[name], DataTable: strings.HasPrefix(name, "_")}
+		t := &Table{Name: name, MsName: mcols[0].table, Rows: counts[name], SizeMB: sizes[name]}
 		bad := false
 		for _, pc := range pcols {
 			mc, ok := byName[pc.name]
