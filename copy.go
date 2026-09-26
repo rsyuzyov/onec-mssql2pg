@@ -1,0 +1,338 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"log"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Task — таблица целиком или диапазон ее ведущего ключа.
+type Task struct {
+	T     *Table
+	Where string // условие на ключ, пусто — вся таблица
+	Part  int
+	Parts int
+	Est   int64
+}
+
+func qms(name string) string { return "[" + strings.ReplaceAll(name, "]", "]]") + "]" }
+func qpg(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
+
+// splitTable режет большую таблицу на части по кластерному ключу. Колонки ключа с единственным
+// значением (разделитель, тип составного поля) уходят в условие равенства; колонка с немногими
+// значениями делится по значениям со спуском к следующей колонке; колонка с многими значениями
+// режется диапазонами по квантилям выборки TABLESAMPLE.
+func splitTable(ctx context.Context, db *sql.DB, t *Table, parts int) ([]Task, error) {
+	single := []Task{{T: t, Part: 1, Parts: 1, Est: t.Rows}}
+	if parts <= 1 || len(t.Keys) == 0 {
+		return single, nil
+	}
+	pct := 200000.0 * 100 / float64(t.Rows+1)
+	if pct > 100 {
+		pct = 100
+	}
+	if pct < 0.001 {
+		pct = 0.001
+	}
+	var conds []string
+	if err := splitRange(ctx, db, t, nil, 0, parts, pct, &conds); err != nil {
+		return nil, err
+	}
+	if len(conds) <= 1 {
+		return single, nil
+	}
+	tasks := make([]Task, len(conds))
+	for i, c := range conds {
+		tasks[i] = Task{T: t, Where: c, Part: i + 1, Parts: len(conds), Est: t.Rows / int64(len(conds))}
+	}
+	return tasks, nil
+}
+
+func and(c []string) string { return strings.Join(c, " and ") }
+
+// splitRange добавляет в out непересекающиеся условия, покрывающие строки с условием prefix.
+func splitRange(ctx context.Context, db *sql.DB, t *Table, prefix []string, ki, parts int, pct float64, out *[]string) error {
+	whole := func() { *out = append(*out, and(prefix)) }
+	if parts <= 1 || ki >= len(t.Keys) {
+		whole()
+		return nil
+	}
+	k := t.Keys[ki]
+	col := qms(k.Name)
+	lit := func(b []byte) string { return fmt.Sprintf("convert(%s, 0x%s)", k.Type, hex.EncodeToString(b)) }
+	with := func(extra ...string) []string { return append(append([]string{}, prefix...), extra...) }
+	where := ""
+	if len(prefix) > 0 {
+		where = " where " + and(prefix)
+	}
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(
+		"select convert(varbinary(900), x.c) from (select %s c from %s tablesample system (%.4f percent) with (nolock)%s) x where x.c is not null order by x.c",
+		col, qms(t.MsName), pct, where))
+	if err != nil {
+		return err
+	}
+	var sample [][]byte
+	for rows.Next() {
+		var b []byte
+		if err := rows.Scan(&b); err != nil {
+			rows.Close()
+			return err
+		}
+		sample = append(sample, b)
+	}
+	rows.Close()
+	if len(sample) < 100 {
+		whole()
+		return nil
+	}
+	// Частоты значений в выборке (она отсортирована).
+	type grp struct {
+		v []byte
+		n int
+	}
+	var groups []grp
+	for _, b := range sample {
+		if len(groups) > 0 && string(groups[len(groups)-1].v) == string(b) {
+			groups[len(groups)-1].n++
+		} else {
+			groups = append(groups, grp{b, 1})
+		}
+	}
+	if len(groups) <= 64 {
+		// Немного значений: по каждому — свое равенство и спуск к следующей колонке ключа.
+		var vals []string
+		for _, g := range groups {
+			sub := int(float64(parts)*float64(g.n)/float64(len(sample)) + 0.5)
+			if sub < 1 {
+				sub = 1
+			}
+			vals = append(vals, lit(g.v))
+			if err := splitRange(ctx, db, t, with(fmt.Sprintf("%s = %s", col, lit(g.v))), ki+1, sub, pct, out); err != nil {
+				return err
+			}
+		}
+		// Значения, не попавшие в выборку, и NULL — отдельной частью.
+		*out = append(*out, and(with(fmt.Sprintf("(%s not in (%s) or %s is null)", col, strings.Join(vals, ", "), col))))
+		return nil
+	}
+	var bounds [][]byte
+	for i := 1; i < parts; i++ {
+		b := sample[len(sample)*i/parts]
+		if len(bounds) > 0 && string(bounds[len(bounds)-1]) == string(b) {
+			continue
+		}
+		bounds = append(bounds, b)
+	}
+	for i := 0; i <= len(bounds); i++ {
+		var c []string
+		if i > 0 {
+			c = append(c, fmt.Sprintf("%s > %s", col, lit(bounds[i-1])))
+		}
+		if i < len(bounds) {
+			c = append(c, fmt.Sprintf("%s <= %s", col, lit(bounds[i])))
+		}
+		if i == 0 {
+			c = []string{"(" + and(c) + " or " + col + " is null)"}
+		}
+		*out = append(*out, and(with(c...)))
+	}
+	return nil
+}
+
+type stats struct {
+	rows  atomic.Int64
+	fx    fixes
+	fxMu  sync.Mutex
+	done  atomic.Int64
+	total int64
+}
+
+func runTask(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tk Task, yearOffset int, st *stats) (int64, error) {
+	t := tk.T
+	off := 0
+	if t.DataTable {
+		off = yearOffset
+	}
+	var fx fixes
+	encs := make([]encoder, len(t.Cols))
+	msCols := make([]string, len(t.Cols))
+	pgCols := make([]string, len(t.Cols))
+	for i, c := range t.Cols {
+		e, err := makeEncoder(c, off, &fx)
+		if err != nil {
+			return 0, err
+		}
+		encs[i] = e
+		msCols[i] = qms(c.MsName)
+		pgCols[i] = qpg(c.Name)
+	}
+	q := fmt.Sprintf("select %s from %s with (nolock)", strings.Join(msCols, ", "), qms(t.MsName))
+	if tk.Where != "" {
+		q += " where " + tk.Where
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return 0, fmt.Errorf("%s: чтение: %w", t.Name, err)
+	}
+	defer rows.Close()
+
+	pr, pw := io.Pipe()
+	var n int64
+	go func() {
+		bw := bufio.NewWriterSize(pw, 1<<20)
+		vals := make([]any, len(encs))
+		ptrs := make([]any, len(encs))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		var err error
+		for rows.Next() {
+			if err = rows.Scan(ptrs...); err != nil {
+				break
+			}
+			for i, e := range encs {
+				if i > 0 {
+					bw.WriteByte('\t')
+				}
+				if err = e(bw, vals[i]); err != nil {
+					err = fmt.Errorf("%s.%s: %w", t.Name, t.Cols[i].Name, err)
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+			bw.WriteByte('\n')
+			n++
+			if n%10000 == 0 {
+				st.rows.Add(10000)
+			}
+		}
+		if err == nil {
+			err = rows.Err()
+		}
+		st.rows.Add(n % 10000)
+		if err == nil {
+			err = bw.Flush()
+		}
+		pw.CloseWithError(err)
+	}()
+
+	conn, err := pg.Acquire(ctx)
+	if err != nil {
+		pr.CloseWithError(err)
+		return 0, err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, "set synchronous_commit = off"); err != nil {
+		pr.CloseWithError(err)
+		return 0, err
+	}
+	_, err = conn.Conn().PgConn().CopyFrom(ctx, pr, fmt.Sprintf("copy %s (%s) from stdin", qpg(t.Name), strings.Join(pgCols, ", ")))
+	if err != nil {
+		cancel()
+		pr.CloseWithError(err)
+		return n, fmt.Errorf("%s: запись: %w", t.Name, err)
+	}
+	st.fxMu.Lock()
+	st.fx.nulChars += fx.nulChars
+	st.fxMu.Unlock()
+	return n, nil
+}
+
+func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table, workers int, splitRows int64, yearOffset int, truncate bool) error {
+	var tasks []Task
+	for _, t := range tables {
+		parts := 1
+		if splitRows > 0 && t.Rows > splitRows {
+			parts = int(t.Rows/splitRows) + 1
+			if parts > 64 {
+				parts = 64
+			}
+		}
+		tt, err := splitTable(ctx, db, t, parts)
+		if err != nil {
+			return fmt.Errorf("%s: разбиение: %w", t.Name, err)
+		}
+		tasks = append(tasks, tt...)
+	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].Est > tasks[j].Est })
+
+	if truncate {
+		for _, t := range tables {
+			if _, err := pg.Exec(ctx, "truncate "+qpg(t.Name)); err != nil {
+				return fmt.Errorf("%s: truncate: %w", t.Name, err)
+			}
+		}
+	}
+
+	st := &stats{total: int64(len(tasks))}
+	start := time.Now()
+	stop := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(30 * time.Second)
+		defer tick.Stop()
+		var last int64
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				r := st.rows.Load()
+				log.Printf("прогресс: задач %d/%d, строк %d, %.0f строк/с за 30 с", st.done.Load(), st.total, r, float64(r-last)/30)
+				last = r
+			}
+		}
+	}()
+
+	ch := make(chan Task)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var errs []string
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tk := range ch {
+				t0 := time.Now()
+				n, err := runTask(ctx, db, pg, tk, yearOffset, st)
+				st.done.Add(1)
+				if err != nil {
+					errMu.Lock()
+					errs = append(errs, err.Error())
+					errMu.Unlock()
+					log.Printf("ОШИБКА %s [%d/%d]: %v", tk.T.Name, tk.Part, tk.Parts, err)
+					continue
+				}
+				if d := time.Since(t0); d > 10*time.Second || tk.Parts > 1 {
+					log.Printf("готово %s [%d/%d]: %d строк за %s", tk.T.Name, tk.Part, tk.Parts, n, d.Round(time.Second))
+				}
+			}
+		}()
+	}
+	for _, tk := range tasks {
+		ch <- tk
+	}
+	close(ch)
+	wg.Wait()
+	close(stop)
+	log.Printf("итого: задач %d, строк %d за %s; удалено символов U+0000: %d",
+		st.total, st.rows.Load(), time.Since(start).Round(time.Second), st.fx.nulChars)
+	if len(errs) > 0 {
+		return fmt.Errorf("ошибок: %d, первая: %s", len(errs), errs[0])
+	}
+	return nil
+}
