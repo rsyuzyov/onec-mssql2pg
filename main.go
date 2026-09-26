@@ -36,7 +36,8 @@ func main() {
 
 	ctx := context.Background()
 	msDSN, pgDSN, refDSN := os.Getenv("MSSQL_DSN"), os.Getenv("PG_DSN"), os.Getenv("PG_REF_DSN")
-	if pgDSN == "" || (*mode != "verify-pg" && msDSN == "") || (*mode == "verify-pg" && refDSN == "") {
+	needMs := *mode != "verify-pg" && *mode != "ddl"
+	if pgDSN == "" || (needMs && msDSN == "") || (*mode == "verify-pg" && refDSN == "") {
 		log.Fatal("нужны переменные окружения MSSQL_DSN и PG_DSN (для verify-pg — PG_DSN и PG_REF_DSN)")
 	}
 	pgCfg, err := pgxpool.ParseConfig(pgDSN)

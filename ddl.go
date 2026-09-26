@@ -39,17 +39,32 @@ func parseDDL(text string) []ddlStmt {
 			continue
 		}
 		st := ddlStmt{sql: s}
-		f := strings.Fields(s)
-		for i, w := range f {
-			if (strings.EqualFold(w, "ON") || strings.EqualFold(w, "ONLY")) && i+1 < len(f) {
-				st.table = strings.TrimPrefix(f[i+1], "public.")
-				break
-			}
-		}
+		st.table = ddlTable(strings.Fields(s))
 		st.pk = strings.Contains(u, "PRIMARY KEY")
 		out = append(out, st)
 	}
 	return out
+}
+
+// ddlTable — таблица команды: в ALTER TABLE [ONLY] — слово после TABLE/ONLY
+// (в "ALTER TABLE t CLUSTER ON i" после ON стоит индекс), в CREATE INDEX — слово после ON.
+func ddlTable(f []string) string {
+	name := ""
+	if len(f) > 2 && strings.EqualFold(f[0], "ALTER") && strings.EqualFold(f[1], "TABLE") {
+		i := 2
+		if strings.EqualFold(f[i], "ONLY") && len(f) > 3 {
+			i++
+		}
+		name = f[i]
+	} else {
+		for i, w := range f {
+			if strings.EqualFold(w, "ON") && i+1 < len(f) {
+				name = f[i+1]
+				break
+			}
+		}
+	}
+	return strings.TrimPrefix(name, "public.")
 }
 
 // runDDL выполняет команды параллельно. Команды одной таблицы идут одна за другой в одном
