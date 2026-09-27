@@ -23,6 +23,7 @@ type Task struct {
 	T     *Table
 	Where string // условие на ключ, пусто — вся таблица
 	Part  int
+	Solo  bool // wal_level=minimal: TRUNCATE и COPY в одной транзакции — без WAL
 	Parts int
 	Est   int64
 }
@@ -279,11 +280,25 @@ func runTask(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tk Task, yearOff
 	if copyBinary {
 		cmd += " with (format binary)"
 	}
+	if tk.Solo {
+		if _, err := conn.Exec(ctx, "begin; truncate "+qpg(t.Name)); err != nil {
+			pr.CloseWithError(err)
+			return 0, fmt.Errorf("%s: truncate: %w", t.Name, err)
+		}
+	}
 	_, err = conn.Conn().PgConn().CopyFrom(ctx, pr, cmd)
 	if err != nil {
 		cancel()
 		pr.CloseWithError(err)
+		if tk.Solo {
+			conn.Exec(context.Background(), "rollback")
+		}
 		return n, fmt.Errorf("%s: запись: %w", t.Name, err)
+	}
+	if tk.Solo {
+		if _, err := conn.Exec(ctx, "commit"); err != nil {
+			return n, fmt.Errorf("%s: commit: %w", t.Name, err)
+		}
 	}
 	st.fxMu.Lock()
 	st.fx.nulChars += fx.nulChars
@@ -319,6 +334,31 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 		tasks = append(tasks, tt...)
 	}
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].Est > tasks[j].Est })
+
+	// При wal_level=minimal журнал не пишется для таблицы, очищенной в той же транзакции (цельные
+	// таблицы), и для UNLOGGED (разрезанные: их части льются параллельно, после — SET LOGGED).
+	var walLevel string
+	if err := pg.QueryRow(ctx, "select current_setting('wal_level')").Scan(&walLevel); err != nil {
+		return err
+	}
+	var unlogged []string
+	if walLevel == "minimal" {
+		for i := range tasks {
+			if tasks[i].Parts == 1 {
+				tasks[i].Solo = true
+			} else if tasks[i].Part == 1 {
+				unlogged = append(unlogged, tasks[i].T.Name)
+			}
+		}
+		for _, t := range unlogged {
+			if _, err := pg.Exec(ctx, "alter table "+qpg(t)+" set unlogged"); err != nil {
+				return fmt.Errorf("%s: set unlogged: %w", t, err)
+			}
+		}
+		log.Printf("wal_level=minimal: без журнала — цельных таблиц %d, разрезанных (UNLOGGED) %d", len(tasks)-countParts(tasks, unlogged), len(unlogged))
+	} else {
+		log.Printf("wal_level=%s: журнал пишется (ускорить — режим prepare)", walLevel)
+	}
 
 	if truncate {
 		for _, t := range tables {
@@ -378,10 +418,61 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 	close(ch)
 	wg.Wait()
 	close(stop)
+	if len(unlogged) > 0 {
+		t0 := time.Now()
+		if err := parallelExec(ctx, pg, unlogged, workers, func(t string) string { return "alter table " + qpg(t) + " set logged" }); err != nil {
+			errs = append(errs, err.Error())
+		}
+		log.Printf("SET LOGGED для %d таблиц за %s", len(unlogged), time.Since(t0).Round(time.Second))
+	}
 	log.Printf("итого: задач %d, строк %d за %s; удалено символов U+0000: %d",
 		st.total, st.rows.Load(), time.Since(start).Round(time.Second), st.fx.nulChars)
 	if len(errs) > 0 {
 		return fmt.Errorf("ошибок: %d, первая: %s", len(errs), errs[0])
+	}
+	return nil
+}
+
+func countParts(tasks []Task, tables []string) int {
+	set := map[string]bool{}
+	for _, t := range tables {
+		set[t] = true
+	}
+	n := 0
+	for _, tk := range tasks {
+		if set[tk.T.Name] {
+			n++
+		}
+	}
+	return n
+}
+
+// parallelExec выполняет по команде на таблицу в workers потоков.
+func parallelExec(ctx context.Context, pg *pgxpool.Pool, tables []string, workers int, stmt func(string) string) error {
+	ch := make(chan string)
+	var mu sync.Mutex
+	var errs []string
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range ch {
+				if _, err := pg.Exec(ctx, stmt(t)); err != nil {
+					mu.Lock()
+					errs = append(errs, fmt.Sprintf("%s: %v", t, err))
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, t := range tables {
+		ch <- t
+	}
+	close(ch)
+	wg.Wait()
+	if len(errs) > 0 {
+		return fmt.Errorf("ошибок %d, первая: %s", len(errs), errs[0])
 	}
 	return nil
 }

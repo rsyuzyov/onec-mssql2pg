@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -23,13 +24,18 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "copy", "copy | plan | splits | verify-counts | verify-pg | ddl")
+	mode := flag.String("mode", "copy", "copy | plan | splits | verify-counts | verify-pg | ddl | prepare | restore")
 	workers := flag.Int("workers", 24, "число параллельных потоков")
 	splitRows := flag.Int64("split-rows", 20_000_000, "таблицы больше этого числа строк делятся на части по ключу")
 	splitMB := flag.Int64("split-mb", 2048, "таблицы больше этого объема (МБ, с LOB) делятся на части по ключу")
 	ddlFile := flag.String("ddl", "", "режим ddl: файл с командами (CREATE INDEX, ALTER TABLE ...), выполняются параллельно")
 	format := flag.String("format", "binary", "формат COPY в PostgreSQL: binary | text")
 	gcPercent := flag.Int("gc", 400, "GOGC для утилиты: реже сборка мусора ценой памяти")
+	stateFile := flag.String("state", "onec-mssql2pg-state.json", "prepare/restore: файл с прежними настройками сервера")
+	restartCmd := flag.String("restart-cmd", "", "prepare/restore: команда перезапуска PostgreSQL; без нее — выход с кодом 3")
+	unsafe := flag.Bool("unsafe", false, "prepare: еще и fsync=off, full_page_writes=off (сбой посреди заливки — заливать заново)")
+	mwm := flag.String("maintenance-work-mem", "2GB", "prepare: maintenance_work_mem на время заливки и индексов")
+	maintWorkers := flag.Int("maint-workers", 8, "prepare: max_parallel_maintenance_workers")
 	only := flag.String("only", "", "регулярное выражение: переносить только эти таблицы (имена PG)")
 	exclude := flag.String("exclude", "", "регулярное выражение: не переносить эти таблицы (имена PG)")
 	truncate := flag.Bool("truncate", false, "очистить целевые таблицы перед заливкой")
@@ -41,7 +47,7 @@ func main() {
 
 	ctx := context.Background()
 	msDSN, pgDSN, refDSN := os.Getenv("MSSQL_DSN"), os.Getenv("PG_DSN"), os.Getenv("PG_REF_DSN")
-	needMs := *mode != "verify-pg" && *mode != "ddl"
+	needMs := *mode == "copy" || *mode == "plan" || *mode == "splits" || *mode == "verify-counts"
 	if pgDSN == "" || (needMs && msDSN == "") || (*mode == "verify-pg" && refDSN == "") {
 		log.Fatal("нужны переменные окружения MSSQL_DSN и PG_DSN (для verify-pg — PG_DSN и PG_REF_DSN)")
 	}
@@ -68,6 +74,23 @@ func main() {
 			return false
 		}
 		return true
+	}
+
+	if *mode == "prepare" || *mode == "restore" {
+		var err error
+		if *mode == "prepare" {
+			err = runPrepare(ctx, pg, *stateFile, *restartCmd, *unsafe, *mwm, *maintWorkers)
+		} else {
+			err = runRestore(ctx, pg, *stateFile, *restartCmd)
+		}
+		if errors.Is(err, errRestart) {
+			log.Print("перезапусти PostgreSQL и запусти режим еще раз (или передай -restart-cmd)")
+			os.Exit(3)
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	if *mode == "ddl" {
