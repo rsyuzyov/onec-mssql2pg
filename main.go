@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strings"
 
@@ -27,12 +28,16 @@ func main() {
 	splitRows := flag.Int64("split-rows", 20_000_000, "таблицы больше этого числа строк делятся на части по ключу")
 	splitMB := flag.Int64("split-mb", 2048, "таблицы больше этого объема (МБ, с LOB) делятся на части по ключу")
 	ddlFile := flag.String("ddl", "", "режим ddl: файл с командами (CREATE INDEX, ALTER TABLE ...), выполняются параллельно")
+	format := flag.String("format", "binary", "формат COPY в PostgreSQL: binary | text")
+	gcPercent := flag.Int("gc", 400, "GOGC для утилиты: реже сборка мусора ценой памяти")
 	only := flag.String("only", "", "регулярное выражение: переносить только эти таблицы (имена PG)")
 	exclude := flag.String("exclude", "", "регулярное выражение: не переносить эти таблицы (имена PG)")
 	truncate := flag.Bool("truncate", false, "очистить целевые таблицы перед заливкой")
 	ignoreCols := flag.String("ignore-cols", "", "verify-pg: колонки через запятую, которые не сравнивать (например _version)")
 	yearOffset := flag.Int("year-offset", -1, "сдвиг лет дат 1С в MS SQL; -1 — взять из _YearOffset")
 	flag.Parse()
+	copyBinary = *format == "binary"
+	debug.SetGCPercent(*gcPercent)
 
 	ctx := context.Background()
 	msDSN, pgDSN, refDSN := os.Getenv("MSSQL_DSN"), os.Getenv("PG_DSN"), os.Getenv("PG_REF_DSN")

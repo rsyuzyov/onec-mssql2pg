@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -158,21 +159,44 @@ type stats struct {
 	total int64
 }
 
+// copyBinary — писать в PG двоичным COPY (по умолчанию) или текстовым.
+var copyBinary = true
+
+// binHeader: PGCOPY, 0x0a 0xff 0x0d 0x0a 0x00, flags int32, header extension length int32.
+var binHeader = []byte{'P', 'G', 'C', 'O', 'P', 'Y', 0x0a, 0xff, 0x0d, 0x0a, 0x00, 0, 0, 0, 0, 0, 0, 0, 0}
+
 func runTask(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tk Task, yearOffset int, st *stats) (int64, error) {
 	t := tk.T
 	off := yearOffset // сдвиг лет есть и в служебных таблицах (config, configcas...)
 	var fx fixes
-	encs := make([]encoder, len(t.Cols))
 	msCols := make([]string, len(t.Cols))
 	pgCols := make([]string, len(t.Cols))
+	dests := make([]any, len(t.Cols))
+	var encs []encoder
+	var bencs []func(w *bufio.Writer) error
 	for i, c := range t.Cols {
+		pgCols[i] = qpg(c.Name)
+		if copyBinary {
+			bc, err := makeBinCol(c, off, &fx)
+			if err != nil {
+				return 0, fmt.Errorf("%s.%s: %w", t.Name, c.Name, err)
+			}
+			msCols[i], dests[i] = bc.expr, bc.dest
+			bencs = append(bencs, bc.enc)
+			continue
+		}
 		e, err := makeEncoder(c, off, &fx)
 		if err != nil {
 			return 0, err
 		}
-		encs[i] = e
+		encs = append(encs, e)
 		msCols[i] = qms(c.MsName)
-		pgCols[i] = qpg(c.Name)
+	}
+	vals := make([]any, len(t.Cols))
+	if !copyBinary {
+		for i := range vals {
+			dests[i] = &vals[i]
+		}
 	}
 	q := fmt.Sprintf("select %s from %s with (nolock)", strings.Join(msCols, ", "), qms(t.MsName))
 	if tk.Where != "" {
@@ -190,29 +214,39 @@ func runTask(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tk Task, yearOff
 	var n int64
 	go func() {
 		bw := bufio.NewWriterSize(pw, 1<<20)
-		vals := make([]any, len(encs))
-		ptrs := make([]any, len(encs))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
 		var err error
+		if copyBinary {
+			bw.Write(binHeader)
+		}
+		var nf [2]byte
+		binary.BigEndian.PutUint16(nf[:], uint16(len(t.Cols)))
 		for rows.Next() {
-			if err = rows.Scan(ptrs...); err != nil {
+			if err = rows.Scan(dests...); err != nil {
 				break
 			}
-			for i, e := range encs {
-				if i > 0 {
-					bw.WriteByte('\t')
+			if copyBinary {
+				bw.Write(nf[:])
+				for i, e := range bencs {
+					if err = e(bw); err != nil {
+						err = fmt.Errorf("%s.%s: %w", t.Name, t.Cols[i].Name, err)
+						break
+					}
 				}
-				if err = e(bw, vals[i]); err != nil {
-					err = fmt.Errorf("%s.%s: %w", t.Name, t.Cols[i].Name, err)
-					break
+			} else {
+				for i, e := range encs {
+					if i > 0 {
+						bw.WriteByte('\t')
+					}
+					if err = e(bw, vals[i]); err != nil {
+						err = fmt.Errorf("%s.%s: %w", t.Name, t.Cols[i].Name, err)
+						break
+					}
 				}
+				bw.WriteByte('\n')
 			}
 			if err != nil {
 				break
 			}
-			bw.WriteByte('\n')
 			n++
 			if n%10000 == 0 {
 				st.rows.Add(10000)
@@ -222,6 +256,9 @@ func runTask(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tk Task, yearOff
 			err = rows.Err()
 		}
 		st.rows.Add(n % 10000)
+		if err == nil && copyBinary {
+			bw.Write([]byte{0xff, 0xff})
+		}
 		if err == nil {
 			err = bw.Flush()
 		}
@@ -238,7 +275,11 @@ func runTask(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tk Task, yearOff
 		pr.CloseWithError(err)
 		return 0, err
 	}
-	_, err = conn.Conn().PgConn().CopyFrom(ctx, pr, fmt.Sprintf("copy %s (%s) from stdin", qpg(t.Name), strings.Join(pgCols, ", ")))
+	cmd := fmt.Sprintf("copy %s (%s) from stdin", qpg(t.Name), strings.Join(pgCols, ", "))
+	if copyBinary {
+		cmd += " with (format binary)"
+	}
+	_, err = conn.Conn().PgConn().CopyFrom(ctx, pr, cmd)
 	if err != nil {
 		cancel()
 		pr.CloseWithError(err)
