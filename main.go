@@ -16,6 +16,7 @@ import (
 	"os"
 	"regexp"
 	"runtime/debug"
+	"runtime/pprof"
 	"sort"
 	"strings"
 
@@ -36,16 +37,35 @@ func main() {
 	safe := flag.Bool("safe", false, "prepare: не выключать fsync и full_page_writes (по умолчанию выключаются: до конца переноса база не боевая)")
 	mwm := flag.String("maintenance-work-mem", "2GB", "prepare: maintenance_work_mem на время заливки и индексов")
 	maintWorkers := flag.Int("maint-workers", 8, "prepare: max_parallel_maintenance_workers")
+	cpuProfile := flag.String("cpuprofile", "", "записать профиль процессора (pprof) в файл")
+	unloggedSplit := flag.Bool("unlogged-split", false, "copy: разрезанные таблицы UNLOGGED на время заливки (SET LOGGED после переписывает таблицу в один поток — обычно невыгодно)")
+	phase := flag.String("phase", "all", "copy: all | pre (очистка) | load (заливка своей доли) | post (SET LOGGED) — для запуска на нескольких хостах")
+	shard := flag.String("shard", "", "copy: доля задач K/N (1..N) для запуска на N хостах, например 1/2")
 	only := flag.String("only", "", "регулярное выражение: переносить только эти таблицы (имена PG)")
 	exclude := flag.String("exclude", "", "регулярное выражение: не переносить эти таблицы (имена PG)")
 	truncate := flag.Bool("truncate", false, "очистить целевые таблицы перед заливкой")
 	ignoreCols := flag.String("ignore-cols", "", "verify-pg: колонки через запятую, которые не сравнивать (например _version)")
 	yearOffset := flag.Int("year-offset", -1, "сдвиг лет дат 1С в MS SQL; -1 — взять из _YearOffset")
 	flag.Parse()
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 	copyBinary = *format == "binary"
 	debug.SetGCPercent(*gcPercent)
 
 	ctx := context.Background()
+	shardK, shardN := 0, 1
+	if *shard != "" {
+		if _, err := fmt.Sscanf(*shard, "%d/%d", &shardK, &shardN); err != nil || shardK < 1 || shardK > shardN {
+			log.Fatalf("-shard: нужно K/N, 1 <= K <= N, получено %q", *shard)
+		}
+		shardK--
+	}
 	msDSN, pgDSN, refDSN := os.Getenv("MSSQL_DSN"), os.Getenv("PG_DSN"), os.Getenv("PG_REF_DSN")
 	needMs := *mode == "copy" || *mode == "plan" || *mode == "splits" || *mode == "verify-counts"
 	if pgDSN == "" || (needMs && msDSN == "") || (*mode == "verify-pg" && refDSN == "") {
@@ -186,7 +206,9 @@ func main() {
 			}
 		}
 	case "copy":
-		if err := runCopy(ctx, db, pg, tables, *workers, *splitRows, *splitMB, *yearOffset, *truncate); err != nil {
+		if err := runCopy(ctx, db, pg, tables, copyOpts{workers: *workers, splitRows: *splitRows, splitMB: *splitMB,
+			yearOffset: *yearOffset, truncate: *truncate, unloggedSplit: *unloggedSplit, phase: *phase,
+			shardK: shardK, shardN: shardN}); err != nil {
 			log.Fatal(err)
 		}
 	case "verify-counts":

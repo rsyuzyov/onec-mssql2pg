@@ -79,7 +79,7 @@ func splitRange(ctx context.Context, db *sql.DB, t *Table, prefix []string, ki, 
 		where = " where " + and(prefix)
 	}
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(
-		"select convert(varbinary(900), x.c) from (select %s c from %s tablesample system (%.4f percent) with (nolock)%s) x where x.c is not null order by x.c",
+		"select convert(varbinary(900), x.c) from (select %s c from %s tablesample system (%.4f percent) repeatable (1541) with (nolock)%s) x where x.c is not null order by x.c",
 		col, qms(t.MsName), pct, where))
 	if err != nil {
 		return err
@@ -323,7 +323,20 @@ func partsFor(t *Table, splitRows, splitMB int64) int {
 	return parts
 }
 
-func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table, workers int, splitRows, splitMB int64, yearOffset int, truncate bool) error {
+// copyOpts — параметры заливки.
+type copyOpts struct {
+	workers        int
+	splitRows      int64
+	splitMB        int64
+	yearOffset     int
+	truncate       bool
+	unloggedSplit  bool   // разрезанные таблицы — UNLOGGED на время заливки (SET LOGGED после — перезапись в один поток)
+	phase          string // all | pre | load | post
+	shardK, shardN int    // заливка на нескольких хостах: этот экземпляр берет задачи с номером i%N == K
+}
+
+func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table, o copyOpts) error {
+	workers, splitRows, splitMB, yearOffset, truncate := o.workers, o.splitRows, o.splitMB, o.yearOffset, o.truncate
 	var tasks []Task
 	for _, t := range tables {
 		parts := partsFor(t, splitRows, splitMB)
@@ -333,7 +346,18 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 		}
 		tasks = append(tasks, tt...)
 	}
-	sort.Slice(tasks, func(i, j int) bool { return tasks[i].Est > tasks[j].Est })
+	// Порядок задач одинаков у всех экземпляров (выборка для границ — REPEATABLE, копия неизменна):
+	// на этом держится деление задач между хостами.
+	sort.SliceStable(tasks, func(i, j int) bool {
+		a, b := tasks[i], tasks[j]
+		if a.Est != b.Est {
+			return a.Est > b.Est
+		}
+		if a.T.Name != b.T.Name {
+			return a.T.Name < b.T.Name
+		}
+		return a.Part < b.Part
+	})
 
 	// При wal_level=minimal журнал не пишется для таблицы, очищенной в той же транзакции (цельные
 	// таблицы), и для UNLOGGED (разрезанные: их части льются параллельно, после — SET LOGGED).
@@ -341,13 +365,25 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 	if err := pg.QueryRow(ctx, "select current_setting('wal_level')").Scan(&walLevel); err != nil {
 		return err
 	}
-	var unlogged []string
-	if walLevel == "minimal" {
-		for i := range tasks {
-			if tasks[i].Parts == 1 {
-				tasks[i].Solo = true
-			} else if tasks[i].Part == 1 {
-				unlogged = append(unlogged, tasks[i].T.Name)
+	var unlogged, split []string
+	for i := range tasks {
+		if tasks[i].Parts == 1 {
+			tasks[i].Solo = walLevel == "minimal"
+		} else if tasks[i].Part == 1 {
+			split = append(split, tasks[i].T.Name)
+		}
+	}
+	if walLevel == "minimal" && o.unloggedSplit {
+		unlogged = split
+	}
+	pre, load, post := o.phase == "all" || o.phase == "pre", o.phase == "all" || o.phase == "load", o.phase == "all" || o.phase == "post"
+	if pre {
+		// Цельные таблицы очищает сама задача (TRUNCATE в ее транзакции), разрезанные — здесь, один раз.
+		if truncate {
+			for _, t := range tables {
+				if _, err := pg.Exec(ctx, "truncate "+qpg(t.Name)); err != nil {
+					return fmt.Errorf("%s: truncate: %w", t.Name, err)
+				}
 			}
 		}
 		for _, t := range unlogged {
@@ -355,17 +391,28 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 				return fmt.Errorf("%s: set unlogged: %w", t, err)
 			}
 		}
-		log.Printf("wal_level=minimal: без журнала — цельных таблиц %d, разрезанных (UNLOGGED) %d", len(tasks)-countParts(tasks, unlogged), len(unlogged))
+	}
+	if walLevel == "minimal" {
+		log.Printf("wal_level=minimal: без журнала цельные таблицы (%d задач); разрезанных %d, из них UNLOGGED %d",
+			len(tasks)-countParts(tasks, split), len(split), len(unlogged))
 	} else {
 		log.Printf("wal_level=%s: журнал пишется (ускорить — режим prepare)", walLevel)
 	}
-
-	if truncate {
-		for _, t := range tables {
-			if _, err := pg.Exec(ctx, "truncate "+qpg(t.Name)); err != nil {
-				return fmt.Errorf("%s: truncate: %w", t.Name, err)
+	if o.shardN > 1 {
+		var mine []Task
+		for i, tk := range tasks {
+			if i%o.shardN == o.shardK {
+				mine = append(mine, tk)
 			}
 		}
+		log.Printf("экземпляр %d из %d: задач %d из %d", o.shardK+1, o.shardN, len(mine), len(tasks))
+		tasks = mine
+	}
+	if !load {
+		tasks = nil
+	}
+	if !post {
+		unlogged = nil
 	}
 
 	st := &stats{total: int64(len(tasks))}
