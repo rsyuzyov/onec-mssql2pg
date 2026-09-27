@@ -19,13 +19,14 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/microsoft/go-mssqldb"
 )
 
 func main() {
-	mode := flag.String("mode", "copy", "copy | plan | splits | verify-counts | verify-pg | ddl | prepare | restore")
+	mode := flag.String("mode", "copy", "copy | plan | splits | verify-counts | verify-pg | ddl | prepare | restore | delta")
 	workers := flag.Int("workers", 24, "число параллельных потоков")
 	splitRows := flag.Int64("split-rows", 20_000_000, "таблицы больше этого числа строк делятся на части по ключу")
 	splitMB := flag.Int64("split-mb", 2048, "таблицы больше этого объема (МБ, с LOB) делятся на части по ключу")
@@ -43,6 +44,7 @@ func main() {
 	unloggedSplit := flag.Bool("unlogged-split", false, "copy: разрезанные таблицы UNLOGGED на время заливки (SET LOGGED после переписывает таблицу в один поток — обычно невыгодно)")
 	phase := flag.String("phase", "all", "copy: all | pre (очистка) | load (заливка своей доли) | post (SET LOGGED) — для запуска на нескольких хостах")
 	shard := flag.String("shard", "", "copy: доля задач K/N (1..N) для запуска на N хостах, например 1/2")
+	loop := flag.Int("loop", 0, "delta: повторять каждые N секунд (0 — один проход)")
 	only := flag.String("only", "", "регулярное выражение: переносить только эти таблицы (имена PG)")
 	exclude := flag.String("exclude", "", "регулярное выражение: не переносить эти таблицы (имена PG)")
 	truncate := flag.Bool("truncate", false, "очистить целевые таблицы перед заливкой")
@@ -69,7 +71,7 @@ func main() {
 		shardK--
 	}
 	msDSN, pgDSN, refDSN := os.Getenv("MSSQL_DSN"), os.Getenv("PG_DSN"), os.Getenv("PG_REF_DSN")
-	needMs := *mode == "copy" || *mode == "plan" || *mode == "splits" || *mode == "verify-counts"
+	needMs := *mode == "copy" || *mode == "plan" || *mode == "splits" || *mode == "verify-counts" || *mode == "delta"
 	if pgDSN == "" || (needMs && msDSN == "") || (*mode == "verify-pg" && refDSN == "") {
 		log.Fatal("нужны переменные окружения MSSQL_DSN и PG_DSN (для verify-pg — PG_DSN и PG_REF_DSN)")
 	}
@@ -212,6 +214,19 @@ func main() {
 			yearOffset: *yearOffset, truncate: *truncate, unloggedSplit: *unloggedSplit, phase: *phase, fanin: *fanin, perTable: *perTable,
 			shardK: shardK, shardN: shardN}); err != nil {
 			log.Fatal(err)
+		}
+	case "delta":
+		for {
+			if err := runDelta(ctx, db, pg, tables, *workers, *yearOffset); err != nil {
+				if *loop == 0 {
+					log.Fatal(err)
+				}
+				log.Print(err)
+			}
+			if *loop == 0 {
+				break
+			}
+			time.Sleep(time.Duration(*loop) * time.Second)
 		}
 	case "verify-counts":
 		if err := verifyCounts(ctx, db, pg, tables, *workers); err != nil {

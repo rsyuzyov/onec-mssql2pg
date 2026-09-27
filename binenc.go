@@ -179,6 +179,9 @@ func makeBinCol(c Col, yearOffset int, fx *fixes) (*binCol, error) {
 				n = strconv.Itoa(c.MsLen)
 			}
 			bc.expr = fmt.Sprintf("cast(%s as varbinary(%s))", col, n)
+			if c.MsType == "ntext" { // ntext напрямую в varbinary не приводится
+				bc.expr = fmt.Sprintf("cast(cast(%s as nvarchar(max)) as varbinary(max))", col)
+			}
 		}
 		var d sql.RawBytes
 		bc.dest = &d

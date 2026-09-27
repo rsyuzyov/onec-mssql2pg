@@ -346,6 +346,11 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 		if err != nil {
 			return fmt.Errorf("%s: разбиение: %w", t.Name, err)
 		}
+		// Оценка задачи — доля объема таблицы (с LOB), а не строк: иначе таблица с крупными
+		// двоичными данными уходит в хвост очереди и держит всю заливку.
+		for i := range tt {
+			tt[i].Est = (t.SizeMB*1024*1024 + t.Rows*100) / int64(len(tt))
+		}
 		tasks = append(tasks, tt...)
 	}
 	// Порядок задач одинаков у всех экземпляров (выборка для границ — REPEATABLE, копия неизменна):
