@@ -24,9 +24,10 @@ import (
 // errRestart — нужен перезапуск сервера, а команды перезапуска нет.
 var errRestart = errors.New("нужен перезапуск PostgreSQL")
 
-// loadSettings — настройки сервера на время заливки. fsync и full_page_writes — только с -unsafe:
-// после сбоя посреди заливки база негодна и заливка начинается сначала.
-func loadSettings(unsafe bool, mwm string, maintWorkers int) [][2]string {
+// loadSettings — настройки сервера на время заливки. По умолчанию выключаются и fsync с
+// full_page_writes: пока перенос не закончен, база не боевая, и сбой посреди заливки означает
+// заливку заново. -safe оставляет их включенными.
+func loadSettings(safe bool, mwm string, maintWorkers int) [][2]string {
 	s := [][2]string{
 		{"wal_level", "minimal"},
 		{"max_wal_senders", "0"},
@@ -39,11 +40,15 @@ func loadSettings(unsafe bool, mwm string, maintWorkers int) [][2]string {
 		{"max_parallel_maintenance_workers", fmt.Sprint(maintWorkers)},
 		{"wal_skip_threshold", "0"},
 	}
-	if unsafe {
+	if !safe {
 		s = append(s, [2]string{"fsync", "off"}, [2]string{"full_page_writes", "off"})
 	}
 	return s
 }
+
+// prodSafe — что restore включает всегда, каким бы ни было значение до prepare: после переноса
+// база становится боевой.
+var prodSafe = map[string]string{"fsync": "on", "full_page_writes": "on", "autovacuum": "on"}
 
 type savedSetting struct {
 	Name     string `json:"name"`
@@ -116,7 +121,7 @@ func restartIfNeeded(ctx context.Context, pg *pgxpool.Pool, cmd string) error {
 	return errors.New("после перезапуска PostgreSQL не отвечает")
 }
 
-func runPrepare(ctx context.Context, pg *pgxpool.Pool, stateFile, restartCmd string, unsafe bool, mwm string, maintWorkers int) error {
+func runPrepare(ctx context.Context, pg *pgxpool.Pool, stateFile, restartCmd string, safe bool, mwm string, maintWorkers int) error {
 	var st pgState
 	if b, err := os.ReadFile(stateFile); err == nil {
 		// Повторный запуск (после перезапуска): прежние значения уже сохранены, не затираем их.
@@ -129,7 +134,7 @@ func runPrepare(ctx context.Context, pg *pgxpool.Pool, stateFile, restartCmd str
 		if err != nil {
 			return err
 		}
-		for _, s := range loadSettings(unsafe, mwm, maintWorkers) {
+		for _, s := range loadSettings(safe, mwm, maintWorkers) {
 			var v string
 			if err := pg.QueryRow(ctx, "select current_setting($1)", s[0]).Scan(&v); err != nil {
 				return fmt.Errorf("%s: %w", s[0], err)
@@ -146,7 +151,7 @@ func runPrepare(ctx context.Context, pg *pgxpool.Pool, stateFile, restartCmd str
 		}
 		log.Printf("прежние значения сохранены в %s", stateFile)
 	}
-	for _, s := range loadSettings(unsafe, mwm, maintWorkers) {
+	for _, s := range loadSettings(safe, mwm, maintWorkers) {
 		if _, err := pg.Exec(ctx, fmt.Sprintf("alter system set %s = '%s'", s[0], s[1])); err != nil {
 			return fmt.Errorf("alter system %s: %w", s[0], err)
 		}
@@ -186,7 +191,7 @@ func runPrepare(ctx context.Context, pg *pgxpool.Pool, stateFile, restartCmd str
 	if err := os.WriteFile(stateFile, b, 0o600); err != nil {
 		return err
 	}
-	return reportSettings(ctx, pg, loadSettings(unsafe, mwm, maintWorkers), "prepare")
+	return reportSettings(ctx, pg, loadSettings(safe, mwm, maintWorkers), "prepare")
 }
 
 func runRestore(ctx context.Context, pg *pgxpool.Pool, stateFile, restartCmd string) error {
@@ -204,7 +209,21 @@ func runRestore(ctx context.Context, pg *pgxpool.Pool, stateFile, restartCmd str
 		}
 	}
 	var want [][2]string
+	saved := map[string]bool{}
 	for _, s := range st.Saved {
+		saved[s.Name] = true
+	}
+	// Безопасные значения — и для настроек, которые prepare не трогал, но они были выключены вручную.
+	for name := range prodSafe {
+		if !saved[name] {
+			st.Saved = append(st.Saved, savedSetting{Name: name, Value: prodSafe[name], AutoConf: true})
+		}
+	}
+	for _, s := range st.Saved {
+		if v, ok := prodSafe[s.Name]; ok && !sameSetting(s.Value, v) {
+			log.Printf("restore: %s было %s до prepare — включаю %s (база станет боевой)", s.Name, s.Value, v)
+			s.Value, s.AutoConf = v, true
+		}
 		q := fmt.Sprintf("alter system reset %s", s.Name)
 		if s.AutoConf {
 			q = fmt.Sprintf("alter system set %s = '%s'", s.Name, s.Value)
@@ -221,9 +240,15 @@ func runRestore(ctx context.Context, pg *pgxpool.Pool, stateFile, restartCmd str
 	if err := restartIfNeeded(ctx, pg, restartCmd); err != nil {
 		return err
 	}
+	// Файлы, записанные при fsync=off, PostgreSQL сам не досинхронизирует даже после включения
+	// fsync: сбросить их на диск — sync на уровне ОС (документация PostgreSQL, параметр fsync).
 	if _, err := pg.Exec(ctx, "checkpoint"); err != nil {
 		return err
 	}
+	if out, err := exec.Command("sync").CombinedOutput(); err != nil {
+		return fmt.Errorf("sync: %v: %s", err, out)
+	}
+	log.Print("restore: checkpoint и sync выполнены")
 	if err := reportSettings(ctx, pg, want, "restore"); err != nil {
 		return err
 	}

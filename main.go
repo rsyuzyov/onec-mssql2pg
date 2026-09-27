@@ -33,7 +33,7 @@ func main() {
 	gcPercent := flag.Int("gc", 400, "GOGC для утилиты: реже сборка мусора ценой памяти")
 	stateFile := flag.String("state", "onec-mssql2pg-state.json", "prepare/restore: файл с прежними настройками сервера")
 	restartCmd := flag.String("restart-cmd", "", "prepare/restore: команда перезапуска PostgreSQL; без нее — выход с кодом 3")
-	unsafe := flag.Bool("unsafe", false, "prepare: еще и fsync=off, full_page_writes=off (сбой посреди заливки — заливать заново)")
+	safe := flag.Bool("safe", false, "prepare: не выключать fsync и full_page_writes (по умолчанию выключаются: до конца переноса база не боевая)")
 	mwm := flag.String("maintenance-work-mem", "2GB", "prepare: maintenance_work_mem на время заливки и индексов")
 	maintWorkers := flag.Int("maint-workers", 8, "prepare: max_parallel_maintenance_workers")
 	only := flag.String("only", "", "регулярное выражение: переносить только эти таблицы (имена PG)")
@@ -79,7 +79,7 @@ func main() {
 	if *mode == "prepare" || *mode == "restore" {
 		var err error
 		if *mode == "prepare" {
-			err = runPrepare(ctx, pg, *stateFile, *restartCmd, *unsafe, *mwm, *maintWorkers)
+			err = runPrepare(ctx, pg, *stateFile, *restartCmd, *safe, *mwm, *maintWorkers)
 		} else {
 			err = runRestore(ctx, pg, *stateFile, *restartCmd)
 		}
