@@ -174,7 +174,7 @@ func runTask(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tk Task, yearOff
 	pgCols := make([]string, len(t.Cols))
 	dests := make([]any, len(t.Cols))
 	var encs []encoder
-	var bencs []func(w *bufio.Writer) error
+	var bencs []func(w wr) error
 	for i, c := range t.Cols {
 		pgCols[i] = qpg(c.Name)
 		if copyBinary {
@@ -332,6 +332,8 @@ type copyOpts struct {
 	truncate       bool
 	unloggedSplit  bool   // разрезанные таблицы — UNLOGGED на время заливки (SET LOGGED после — перезапись в один поток)
 	phase          string // all | pre | load | post
+	perTable       int    // fanin: не больше читателей на одну таблицу
+	fanin          bool   // wal_level=minimal: много читателей — один COPY на таблицу, без WAL
 	shardK, shardN int    // заливка на нескольких хостах: этот экземпляр берет задачи с номером i%N == K
 }
 
@@ -398,11 +400,47 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 	} else {
 		log.Printf("wal_level=%s: журнал пишется (ускорить — режим prepare)", walLevel)
 	}
+	useFanin := o.fanin && walLevel == "minimal" && copyBinary && !o.unloggedSplit
 	if o.shardN > 1 {
 		var mine []Task
-		for i, tk := range tasks {
-			if i%o.shardN == o.shardK {
-				mine = append(mine, tk)
+		if useFanin {
+			// У таблицы один писатель — делим по таблицам: крупные по очереди туда, где меньше строк.
+			total := map[string]int64{}
+			var names []string
+			for _, tk := range tasks {
+				if _, ok := total[tk.T.Name]; !ok {
+					names = append(names, tk.T.Name)
+				}
+				total[tk.T.Name] += tk.Est
+			}
+			sort.SliceStable(names, func(i, j int) bool {
+				if total[names[i]] != total[names[j]] {
+					return total[names[i]] > total[names[j]]
+				}
+				return names[i] < names[j]
+			})
+			load := make([]int64, o.shardN)
+			owner := map[string]int{}
+			for _, n := range names {
+				k := 0
+				for i := range load {
+					if load[i] < load[k] {
+						k = i
+					}
+				}
+				owner[n] = k
+				load[k] += total[n] + 1
+			}
+			for _, tk := range tasks {
+				if owner[tk.T.Name] == o.shardK {
+					mine = append(mine, tk)
+				}
+			}
+		} else {
+			for i, tk := range tasks {
+				if i%o.shardN == o.shardK {
+					mine = append(mine, tk)
+				}
 			}
 		}
 		log.Printf("экземпляр %d из %d: задач %d из %d", o.shardK+1, o.shardN, len(mine), len(tasks))
@@ -434,36 +472,41 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 		}
 	}()
 
-	ch := make(chan Task)
-	var wg sync.WaitGroup
-	var errMu sync.Mutex
 	var errs []string
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for tk := range ch {
-				t0 := time.Now()
-				n, err := runTask(ctx, db, pg, tk, yearOffset, st)
-				st.done.Add(1)
-				if err != nil {
-					errMu.Lock()
-					errs = append(errs, err.Error())
-					errMu.Unlock()
-					log.Printf("ОШИБКА %s [%d/%d]: %v", tk.T.Name, tk.Part, tk.Parts, err)
-					continue
+	if useFanin {
+		log.Printf("схема «много читателей — один COPY на таблицу»: без журнала и с FREEZE")
+		errs = runFanin(ctx, db, pg, tasks, workers, o.perTable, yearOffset, st)
+	} else {
+		ch := make(chan Task)
+		var wg sync.WaitGroup
+		var errMu sync.Mutex
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for tk := range ch {
+					t0 := time.Now()
+					n, err := runTask(ctx, db, pg, tk, yearOffset, st)
+					st.done.Add(1)
+					if err != nil {
+						errMu.Lock()
+						errs = append(errs, err.Error())
+						errMu.Unlock()
+						log.Printf("ОШИБКА %s [%d/%d]: %v", tk.T.Name, tk.Part, tk.Parts, err)
+						continue
+					}
+					if d := time.Since(t0); d > 10*time.Second || tk.Parts > 1 {
+						log.Printf("готово %s [%d/%d]: %d строк за %s", tk.T.Name, tk.Part, tk.Parts, n, d.Round(time.Second))
+					}
 				}
-				if d := time.Since(t0); d > 10*time.Second || tk.Parts > 1 {
-					log.Printf("готово %s [%d/%d]: %d строк за %s", tk.T.Name, tk.Part, tk.Parts, n, d.Round(time.Second))
-				}
-			}
-		}()
+			}()
+		}
+		for _, tk := range tasks {
+			ch <- tk
+		}
+		close(ch)
+		wg.Wait()
 	}
-	for _, tk := range tasks {
-		ch <- tk
-	}
-	close(ch)
-	wg.Wait()
 	close(stop)
 	if len(unlogged) > 0 {
 		t0 := time.Now()

@@ -38,6 +38,8 @@ func main() {
 	mwm := flag.String("maintenance-work-mem", "2GB", "prepare: maintenance_work_mem на время заливки и индексов")
 	maintWorkers := flag.Int("maint-workers", 8, "prepare: max_parallel_maintenance_workers")
 	cpuProfile := flag.String("cpuprofile", "", "записать профиль процессора (pprof) в файл")
+	fanin := flag.Bool("fanin", true, "copy при wal_level=minimal: части таблицы читаются параллельно и сходятся в один COPY (без WAL, с FREEZE)")
+	perTable := flag.Int("readers-per-table", 8, "copy с fanin: не больше читателей на одну таблицу (один процесс PG пишет ~0,9 млн строк/с)")
 	unloggedSplit := flag.Bool("unlogged-split", false, "copy: разрезанные таблицы UNLOGGED на время заливки (SET LOGGED после переписывает таблицу в один поток — обычно невыгодно)")
 	phase := flag.String("phase", "all", "copy: all | pre (очистка) | load (заливка своей доли) | post (SET LOGGED) — для запуска на нескольких хостах")
 	shard := flag.String("shard", "", "copy: доля задач K/N (1..N) для запуска на N хостах, например 1/2")
@@ -207,7 +209,7 @@ func main() {
 		}
 	case "copy":
 		if err := runCopy(ctx, db, pg, tables, copyOpts{workers: *workers, splitRows: *splitRows, splitMB: *splitMB,
-			yearOffset: *yearOffset, truncate: *truncate, unloggedSplit: *unloggedSplit, phase: *phase,
+			yearOffset: *yearOffset, truncate: *truncate, unloggedSplit: *unloggedSplit, phase: *phase, fanin: *fanin, perTable: *perTable,
 			shardK: shardK, shardN: shardN}); err != nil {
 			log.Fatal(err)
 		}

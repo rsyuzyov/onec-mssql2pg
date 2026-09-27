@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
@@ -17,23 +16,30 @@ import (
 
 var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
 
+// wr — куда пишут кодировщики: bufio.Writer потока COPY или буфер блока строк.
+type wr interface {
+	Write([]byte) (int, error)
+	WriteByte(byte) error
+	WriteString(string) (int, error)
+}
+
 // binCol — чтение одной колонки: выражение в SELECT, приемник Scan и кодировщик.
 type binCol struct {
 	expr string
 	dest any
-	enc  func(w *bufio.Writer) error
+	enc  func(w wr) error
 }
 
-func putLen(w *bufio.Writer, n int) {
+func putLen(w wr, n int) {
 	var b [4]byte
 	binary.BigEndian.PutUint32(b[:], uint32(int32(n)))
 	w.Write(b[:])
 }
 
-func putNull(w *bufio.Writer) { putLen(w, -1) }
+func putNull(w wr) { putLen(w, -1) }
 
 // writeUTF16 пишет UTF-16LE, выбрасывая символы U+0000.
-func writeUTF16(w *bufio.Writer, b []byte, fx *fixes) {
+func writeUTF16(w wr, b []byte, fx *fixes) {
 	nul := 0
 	for i := 0; i+1 < len(b); i += 2 {
 		if b[i] == 0 && b[i+1] == 0 {
@@ -156,7 +162,7 @@ func makeBinCol(c Col, yearOffset int, fx *fixes) (*binCol, error) {
 	case c.MsType == "timestamp": // rowversion -> _version int4, как у платформы — 1
 		var d sql.RawBytes
 		bc.dest = &d
-		bc.enc = func(w *bufio.Writer) error {
+		bc.enc = func(w wr) error {
 			if d == nil {
 				putNull(w)
 				return nil
@@ -177,7 +183,7 @@ func makeBinCol(c Col, yearOffset int, fx *fixes) (*binCol, error) {
 		var d sql.RawBytes
 		bc.dest = &d
 		toText := c.PgType == "text" || c.PgType == "varchar" || c.PgType == "bpchar"
-		bc.enc = func(w *bufio.Writer) error {
+		bc.enc = func(w wr) error {
 			if d == nil {
 				putNull(w)
 				return nil
@@ -209,7 +215,7 @@ func makeBinCol(c Col, yearOffset int, fx *fixes) (*binCol, error) {
 		if c.MsType == "bit" {
 			var d sql.NullBool
 			bc.dest = &d
-			bc.enc = func(w *bufio.Writer) error {
+			bc.enc = func(w wr) error {
 				if !d.Valid {
 					putNull(w)
 					return nil
@@ -225,7 +231,7 @@ func makeBinCol(c Col, yearOffset int, fx *fixes) (*binCol, error) {
 		} else {
 			var d sql.RawBytes
 			bc.dest = &d
-			bc.enc = func(w *bufio.Writer) error {
+			bc.enc = func(w wr) error {
 				if d == nil {
 					putNull(w)
 					return nil
@@ -245,7 +251,7 @@ func makeBinCol(c Col, yearOffset int, fx *fixes) (*binCol, error) {
 	case c.PgType == "bytea":
 		var d sql.RawBytes
 		bc.dest = &d
-		bc.enc = func(w *bufio.Writer) error {
+		bc.enc = func(w wr) error {
 			if d == nil {
 				putNull(w)
 				return nil
@@ -258,7 +264,7 @@ func makeBinCol(c Col, yearOffset int, fx *fixes) (*binCol, error) {
 		var d sql.NullTime
 		bc.dest = &d
 		off := yearOffset
-		bc.enc = func(w *bufio.Writer) error {
+		bc.enc = func(w wr) error {
 			if !d.Valid {
 				putNull(w)
 				return nil
@@ -279,7 +285,7 @@ func makeBinCol(c Col, yearOffset int, fx *fixes) (*binCol, error) {
 		var d sql.RawBytes
 		bc.dest = &d
 		var buf []byte
-		bc.enc = func(w *bufio.Writer) error {
+		bc.enc = func(w wr) error {
 			if d == nil {
 				putNull(w)
 				return nil
@@ -297,7 +303,7 @@ func makeBinCol(c Col, yearOffset int, fx *fixes) (*binCol, error) {
 		var d sql.NullInt64
 		bc.dest = &d
 		size := map[string]int{"int2": 2, "int4": 4, "int8": 8}[c.PgType]
-		bc.enc = func(w *bufio.Writer) error {
+		bc.enc = func(w wr) error {
 			if !d.Valid {
 				putNull(w)
 				return nil
