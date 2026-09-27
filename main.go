@@ -26,7 +26,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "copy", "copy | plan | splits | verify-counts | verify-pg | ddl | prepare | restore | delta")
+	mode := flag.String("mode", "copy", "copy | plan | splits | verify-counts | verify-pg | ddl | prepare | restore | delta | cdc-enable | cdc-disable")
 	workers := flag.Int("workers", 24, "число параллельных потоков")
 	splitRows := flag.Int64("split-rows", 20_000_000, "таблицы больше этого числа строк делятся на части по ключу")
 	splitMB := flag.Int64("split-mb", 2048, "таблицы больше этого объема (МБ, с LOB) делятся на части по ключу")
@@ -44,6 +44,9 @@ func main() {
 	unloggedSplit := flag.Bool("unlogged-split", false, "copy: разрезанные таблицы UNLOGGED на время заливки (SET LOGGED после переписывает таблицу в один поток — обычно невыгодно)")
 	phase := flag.String("phase", "all", "copy: all | pre (очистка) | load (заливка своей доли) | post (SET LOGGED) — для запуска на нескольких хостах")
 	shard := flag.String("shard", "", "copy: доля задач K/N (1..N) для запуска на N хостах, например 1/2")
+	nokey := flag.Bool("nokey", false, "copy: только таблицы без уникального ключа (в окне их переливают целиком — докатить нечем)")
+	lockTimeout := flag.Int("lock-timeout", 2000, "cdc-enable: ожидание блокировки таблицы, мс; не дождались — таблица откладывается")
+	rounds := flag.Int("rounds", 20, "cdc-enable: кругов повтора для отложенных таблиц")
 	loop := flag.Int("loop", 0, "delta: повторять каждые N секунд (0 — один проход)")
 	only := flag.String("only", "", "регулярное выражение: переносить только эти таблицы (имена PG)")
 	exclude := flag.String("exclude", "", "регулярное выражение: не переносить эти таблицы (имена PG)")
@@ -71,7 +74,7 @@ func main() {
 		shardK--
 	}
 	msDSN, pgDSN, refDSN := os.Getenv("MSSQL_DSN"), os.Getenv("PG_DSN"), os.Getenv("PG_REF_DSN")
-	needMs := *mode == "copy" || *mode == "plan" || *mode == "splits" || *mode == "verify-counts" || *mode == "delta"
+	needMs := *mode == "copy" || *mode == "plan" || *mode == "splits" || *mode == "verify-counts" || *mode == "delta" || *mode == "cdc-enable" || *mode == "cdc-disable"
 	if pgDSN == "" || (needMs && msDSN == "") || (*mode == "verify-pg" && refDSN == "") {
 		log.Fatal("нужны переменные окружения MSSQL_DSN и PG_DSN (для verify-pg — PG_DSN и PG_REF_DSN)")
 	}
@@ -183,6 +186,24 @@ func main() {
 			total += t.Rows
 		}
 	}
+	if *nokey {
+		keys, err := uniqueKeys(ctx, db)
+		if err != nil {
+			log.Fatal(err)
+		}
+		var nk []*Table
+		for _, t := range tables {
+			if len(keys[strings.ToLower(t.MsName)]) == 0 {
+				nk = append(nk, t)
+			}
+		}
+		log.Printf("-nokey: таблиц без уникального ключа %d из %d", len(nk), len(tables))
+		tables = nk
+		total = 0
+		for _, t := range tables {
+			total += t.Rows
+		}
+	}
 	sort.Slice(tables, func(i, j int) bool { return tables[i].Rows > tables[j].Rows })
 	log.Printf("таблиц к переносу: %d, строк по статистике: %d, сдвиг лет: %d", len(tables), total, *yearOffset)
 
@@ -213,6 +234,14 @@ func main() {
 		if err := runCopy(ctx, db, pg, tables, copyOpts{workers: *workers, splitRows: *splitRows, splitMB: *splitMB,
 			yearOffset: *yearOffset, truncate: *truncate, unloggedSplit: *unloggedSplit, phase: *phase, fanin: *fanin, perTable: *perTable,
 			shardK: shardK, shardN: shardN}); err != nil {
+			log.Fatal(err)
+		}
+	case "cdc-enable":
+		if err := cdcEnable(ctx, db, tables, *rounds, *lockTimeout); err != nil {
+			log.Fatal(err)
+		}
+	case "cdc-disable":
+		if err := cdcDisable(ctx, db); err != nil {
 			log.Fatal(err)
 		}
 	case "delta":
