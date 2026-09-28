@@ -1,1 +1,5 @@
 bin/
+*.env
+*.secrets.json
+state.json
+*.prof
