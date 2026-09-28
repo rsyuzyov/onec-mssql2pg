@@ -64,6 +64,7 @@ type msCol struct {
 	maxLen, prec, scale int
 }
 
+// loadMs — каталог MS SQL: только таблицы схемы dbo (на базе с CDC sys.tables отдает и таблицы схемы cdc).
 func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int64, map[string][]msCol, map[string]int64, error) {
 	cols := map[string][]msCol{}
 	rows, err := db.QueryContext(ctx, `
@@ -71,6 +72,7 @@ func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int
 		from sys.tables t
 		join sys.columns c on c.object_id = t.object_id
 		join sys.types ty on ty.user_type_id = c.user_type_id
+		where t.schema_id = schema_id('dbo') and t.is_ms_shipped = 0
 		order by t.name, c.column_id`)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -89,6 +91,7 @@ func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int
 	rows, err = db.QueryContext(ctx, `
 		select t.name, sum(p.rows)
 		from sys.tables t join sys.partitions p on p.object_id = t.object_id and p.index_id in (0, 1)
+		where t.schema_id = schema_id('dbo') and t.is_ms_shipped = 0
 		group by t.name`)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -112,6 +115,7 @@ func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int
 		join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id and ic.key_ordinal > 0
 		join sys.columns c on c.object_id = t.object_id and c.column_id = ic.column_id
 		join sys.types ty on ty.user_type_id = c.user_type_id
+		where t.schema_id = schema_id('dbo') and t.is_ms_shipped = 0
 		order by t.name, ic.key_ordinal`)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -131,6 +135,7 @@ func loadMs(ctx context.Context, db *sql.DB) (map[string][]msCol, map[string]int
 		from sys.tables t
 		join sys.partitions p on p.object_id = t.object_id and p.index_id in (0, 1)
 		join sys.allocation_units a on a.container_id = p.partition_id
+		where t.schema_id = schema_id('dbo') and t.is_ms_shipped = 0
 		group by t.name`)
 	if err != nil {
 		return nil, nil, nil, nil, err

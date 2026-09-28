@@ -81,7 +81,8 @@ func uniqueKeys(ctx context.Context, db *sql.DB) (map[string][]string, error) {
 		with u as (
 			select t.object_id, t.name tname, i.index_id,
 				row_number() over (partition by t.object_id order by case when i.type = 1 then 0 when i.is_primary_key = 1 then 1 else 2 end, i.index_id) rn
-			from sys.tables t join sys.indexes i on i.object_id = t.object_id and i.is_unique = 1 and i.has_filter = 0)
+			from sys.tables t join sys.indexes i on i.object_id = t.object_id and i.is_unique = 1 and i.has_filter = 0
+			where t.schema_id = schema_id('dbo') and t.is_ms_shipped = 0)
 		select u.tname, c.name
 		from u join sys.index_columns ic on ic.object_id = u.object_id and ic.index_id = u.index_id and ic.key_ordinal > 0
 		join sys.columns c on c.object_id = ic.object_id and c.column_id = ic.column_id
