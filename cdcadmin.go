@@ -57,14 +57,21 @@ func cdcEnable(ctx context.Context, db *sql.DB, tables []*Table, rounds int, loc
 	start := time.Now()
 	for r := 1; r <= rounds && len(todo) > 0; r++ {
 		var retry []*Table
-		for _, t := range todo {
+		shownErrors := 0
+		for processed, t := range todo {
 			_, err := conn.ExecContext(ctx, `exec sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = @p1,
 				@role_name = NULL, @supports_net_changes = 0`, t.MsName)
 			if err != nil {
 				retry = append(retry, t)
-				if r == rounds {
+				// Первые ошибки круга видны сразу: системная причина (например, @@SERVERNAME не равен имени машины
+				// и задания агента не создаются) иначе выясняется только через все круги повтора.
+				if r == rounds || shownErrors < 3 {
 					log.Printf("%s: %v", t.MsName, err)
+					shownErrors++
 				}
+			}
+			if r == 1 && processed+1 == 20 && len(retry) == 20 {
+				return fmt.Errorf("CDC не включился ни на одной из первых 20 таблиц — причина не в блокировках, см. ошибки выше")
 			}
 		}
 		log.Printf("круг %d: включено %d, отложено %d (%s)", r, len(todo)-len(retry), len(retry), time.Since(start).Round(time.Second))

@@ -23,7 +23,7 @@ type Task struct {
 	T     *Table
 	Where string // условие на ключ, пусто — вся таблица
 	Part  int
-	Solo  bool // wal_level=minimal: TRUNCATE и COPY в одной транзакции — без WAL
+	Solo  bool // цельная таблица: TRUNCATE и COPY в одной транзакции (при wal_level=minimal — еще и без WAL)
 	Parts int
 	Est   int64
 }
@@ -375,7 +375,9 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 	var unlogged, split []string
 	for i := range tasks {
 		if tasks[i].Parts == 1 {
-			tasks[i].Solo = walLevel == "minimal"
+			// Цельную таблицу задача очищает сама при любом wal_level: без этого повторный перелив
+			// (например, -nokey в окне) дописывает строки к уже лежащим.
+			tasks[i].Solo = true
 		} else if tasks[i].Part == 1 {
 			split = append(split, tasks[i].T.Name)
 		}
@@ -392,6 +394,18 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 					return fmt.Errorf("%s: truncate: %w", t.Name, err)
 				}
 			}
+		} else if !useFaninFor(o, walLevel) {
+			// Разрезанные таблицы части льют параллельно, очистить их внутри задачи нельзя: непустая — ошибка,
+			// а не тихое удвоение строк.
+			for _, name := range split {
+				var nonEmpty bool
+				if err := pg.QueryRow(ctx, "select exists (select 1 from "+qpg(name)+")").Scan(&nonEmpty); err != nil {
+					return fmt.Errorf("%s: проверка пустоты: %w", name, err)
+				}
+				if nonEmpty {
+					return fmt.Errorf("%s: таблица не пуста, а части льются без очистки — запустить с -truncate", name)
+				}
+			}
 		}
 		for _, t := range unlogged {
 			if _, err := pg.Exec(ctx, "alter table "+qpg(t)+" set unlogged"); err != nil {
@@ -405,7 +419,7 @@ func runCopy(ctx context.Context, db *sql.DB, pg *pgxpool.Pool, tables []*Table,
 	} else {
 		log.Printf("wal_level=%s: журнал пишется (ускорить — режим prepare)", walLevel)
 	}
-	useFanin := o.fanin && walLevel == "minimal" && copyBinary && !o.unloggedSplit
+	useFanin := useFaninFor(o, walLevel)
 	if o.shardN > 1 {
 		var mine []Task
 		if useFanin {
@@ -570,4 +584,9 @@ func parallelExec(ctx context.Context, pg *pgxpool.Pool, tables []string, worker
 		return fmt.Errorf("ошибок %d, первая: %s", len(errs), errs[0])
 	}
 	return nil
+}
+
+// useFaninFor — части таблицы сходятся в один COPY (с очисткой в той же транзакции): только при wal_level=minimal.
+func useFaninFor(o copyOpts, walLevel string) bool {
+	return o.fanin && walLevel == "minimal" && copyBinary && !o.unloggedSplit
 }

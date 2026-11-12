@@ -26,8 +26,6 @@ param(
 $ErrorActionPreference = 'Stop'
 $sqlcmdExe = Join-Path $SqlToolsDir 'SQLCMD.EXE'
 $bcpExe = Join-Path $SqlToolsDir 'bcp.exe'
-$serviceTables = 'Config','Params','ConfigCAS','Files','IBVersion','_YearOffset','DBSchema','SchemaStorage','v8users',
-    'ConfigSave','ConfigCASSave','DepotFiles','V8USERPWDPLCS','V8USERSMATKEYS'
 
 $envValues = @{}
 Get-Content $EnvFile | Where-Object { $_ -match '=' } | ForEach-Object { $pair = $_.Split('=', 2); $envValues[$pair[0].Trim()] = $pair[1].Trim() }
@@ -69,13 +67,21 @@ Invoke-Checked $sqlcmdExe @('-S', $localSql.Server, '-U', $localSql.User, '-P', 
 Invoke-Checked $sqlcmdExe @('-S', $localSql.Server, '-U', $localSql.User, '-P', $localSql.Password, '-C', '-b', '-d', $SchemaDb, '-i', $ddlFile, '-f', '65001') | Out-Null
 
 Write-Step 'служебные таблицы (bcp)'
+# Список — из самого источника: все таблицы dbo без «_» в начале плюс _YearOffset. Готовый список отстает от платформы:
+# у базы, работающей на 8.5, есть BinaryData (блочное хранилище двоичных данных), и без нее в PostgreSQL все, что
+# читает хранилища значений, падает с «Ошибка блочного хранения двоичных данных». Посторонние таблицы (журнал
+# обслуживания SQL и т.п.) ibcmd не переносит.
+$serviceTables = Invoke-Checked $sqlcmdExe @('-S', $sourceSql.Server, '-U', $sourceSql.User, '-P', $sourceSql.Password, '-C', '-h', '-1', '-W', '-b', '-d', $SourceDb,
+    '-Q', "SET NOCOUNT ON; SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID('dbo') AND is_ms_shipped = 0 AND (name NOT LIKE '[_]%' OR name = '_YearOffset') ORDER BY name") |
+    Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim() }
+"  таблиц: $($serviceTables.Count) — $($serviceTables -join ', ')"
 foreach ($tableName in $serviceTables) {
     $dataFile = Join-Path $stageDir "$tableName.bcp"
     Invoke-Checked $bcpExe @("SELECT * FROM [$SourceDb].dbo.[$tableName]", 'queryout', $dataFile, '-n',
         '-S', $sourceSql.Server, '-U', $sourceSql.User, '-P', $sourceSql.Password) | Out-Null
     $loaded = Invoke-Checked $bcpExe @("[$SchemaDb].dbo.[$tableName]", 'in', $dataFile, '-n', '-b', '500', '-h', 'TABLOCK',
         '-S', $localSql.Server, '-U', $localSql.User, '-P', $localSql.Password)
-    '  {0,-16} {1}' -f $tableName, (($loaded | Select-String 'rows copied') -replace '\s+', ' ')
+    '  {0,-16} {1}' -f $tableName, ((@($loaded) | Where-Object { "$_" -match 'rows copied|скопирован' } | Select-Object -First 1) -replace '\s+', ' ')
 }
 
 Write-Step "ibcmd infobase replicate $SchemaDb -> $PgServer/$TargetPg"
